@@ -1,0 +1,384 @@
+       #!/usr/bin/env python2
+       # Copyright 2013-present Barefoot Networks, Inc.
+       #
+       # Licensed under the Apache License, Version 2.0 (the "License");
+       # you may not use this file except in compliance with the License.
+       # You may obtain a copy of the License at
+       #
+       #    http://www.apache.org/licenses/LICENSE-2.0
+       #
+       # Unless required by applicable law or agreed to in writing, software
+       # distributed under the License is distributed on an "AS IS" BASIS,
+       # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+       # See the License for the specific language governing permissions and
+       # limitations under the License.
+       #
+       # Adapted by Robert MacDavid (macdavid@cs.princeton.edu) from scripts found in
+       # the p4app repository (https://github.com/p4lang/p4app)
+       #
+       # We encourage you to dissect this script to better understand the BMv2/Mininet
+       # environment used by the P4 tutorial.
+       #
+    1: import os, sys, json, subprocess, re, argparse
+    1: from time import sleep
+       
+    1: from p4_mininet import P4Switch, P4Host
+    1: from mininet.log import setLogLevel
+    1: from mininet.net import Mininet
+    1: from mininet.topo import Topo
+    1: from mininet.link import TCLink
+    1: from mininet.cli import CLI
+       
+    1: from p4runtime_switch import P4RuntimeSwitch
+    1: import p4runtime_lib.simple_controller
+       
+    1: def configureP4Switch(**switch_args):
+           """ Helper class that is called by mininet to initialize
+               the virtual P4 switches. The purpose is to ensure each
+               switch's thrift server is using a unique port.
+           """
+    1:     if "sw_path" in switch_args and 'grpc' in switch_args['sw_path']:
+               # If grpc appears in the BMv2 switch target, we assume will start P4Runtime
+    2:         class ConfiguredP4RuntimeSwitch(P4RuntimeSwitch):
+    1:             def __init__(self, *opts, **kwargs):
+    4:                 kwargs.update(switch_args)
+    4:                 P4RuntimeSwitch.__init__(self, *opts, **kwargs)
+       
+    1:             def describe(self):
+    4:                 print "%s -> gRPC port: %d" % (self.name, self.grpc_port)
+       
+    1:         return ConfiguredP4RuntimeSwitch
+           else:
+               class ConfiguredP4Switch(P4Switch):
+                   next_thrift_port = 9090
+                   def __init__(self, *opts, **kwargs):
+                       global next_thrift_port
+                       kwargs.update(switch_args)
+                       kwargs['thrift_port'] = ConfiguredP4Switch.next_thrift_port
+                       ConfiguredP4Switch.next_thrift_port += 1
+                       P4Switch.__init__(self, *opts, **kwargs)
+       
+                   def describe(self):
+                       print "%s -> Thrift port: %d" % (self.name, self.thrift_port)
+       
+               return ConfiguredP4Switch
+       
+       
+    2: class ExerciseTopo(Topo):
+           """ The mininet topology class for the P4 tutorial exercises.
+    1:     """
+    1:     def __init__(self, hosts, switches, links, log_dir, bmv2_exe, pcap_dir, **opts):
+    1:         Topo.__init__(self, **opts)
+    1:         host_links = []
+    1:         switch_links = []
+       
+               # assumes host always comes first for host<-->switch links
+    9:         for link in links:
+    8:             if link['node1'][0] == 'h':
+    4:                 host_links.append(link)
+                   else:
+    4:                 switch_links.append(link)
+       
+    5:         for sw, params in switches.iteritems():
+    4:             if "program" in params:
+                       switchClass = configureP4Switch(
+                               sw_path=bmv2_exe,
+                               json_path=params["program"],
+                               log_console=True,
+                               pcap_dump=pcap_dir)
+                   else:
+                       # add default switch
+    4:                 switchClass = None
+    4:             self.addSwitch(sw, log_file="%s/%s.log" %(log_dir, sw), cls=switchClass)
+       
+    5:         for link in host_links:
+    4:             host_name = link['node1']
+    4:             sw_name, sw_port = self.parse_switch_node(link['node2'])
+    4:             host_ip = hosts[host_name]['ip']
+    4:             host_mac = hosts[host_name]['mac']
+    4:             self.addHost(host_name, ip=host_ip, mac=host_mac)
+    4:             self.addLink(host_name, sw_name,
+    4:                          delay=link['latency'], bw=link['bandwidth'],
+    4:                          port2=sw_port)
+       
+    5:         for link in switch_links:
+    4:             sw1_name, sw1_port = self.parse_switch_node(link['node1'])
+    4:             sw2_name, sw2_port = self.parse_switch_node(link['node2'])
+    4:             self.addLink(sw1_name, sw2_name,
+    4:                         port1=sw1_port, port2=sw2_port,
+    4:                         delay=link['latency'], bw=link['bandwidth'])
+       
+       
+    1:     def parse_switch_node(self, node):
+   12:         assert(len(node.split('-')) == 2)
+   12:         sw_name, sw_port = node.split('-')
+   12:         try:
+   12:             sw_port = int(sw_port[1:])
+               except:
+                   raise Exception('Invalid switch node in topology file: {}'.format(node))
+   12:         return sw_name, sw_port
+       
+       
+    2: class ExerciseRunner:
+           """
+               Attributes:
+                   log_dir  : string   // directory for mininet log files
+                   pcap_dir : string   // directory for mininet switch pcap files
+                   quiet    : bool     // determines if we print logger messages
+       
+                   hosts    : dict<string, dict> // mininet host names and their associated properties
+                   switches : dict<string, dict> // mininet switch names and their associated properties
+                   links    : list<dict>         // list of mininet link properties
+       
+                   switch_json : string // json of the compiled p4 example
+                   bmv2_exe    : string // name or path of the p4 switch binary
+       
+                   topo : Topo object   // The mininet topology instance
+                   net : Mininet object // The mininet instance
+       
+    1:     """
+    1:     def logger(self, *items):
+    7:         if not self.quiet:
+    7:             print(' '.join(items))
+       
+    1:     def format_latency(self, l):
+               """ Helper method for parsing link latencies from the topology json. """
+               if isinstance(l, (str, unicode)):
+                   return l
+               else:
+                   return str(l) + "ms"
+       
+       
+           def __init__(self, topo_file, log_dir, pcap_dir,
+    1:                        switch_json, bmv2_exe='simple_switch', quiet=False):
+               """ Initializes some attributes and reads the topology json. Does not
+                   actually run the exercise. Use run_exercise() for that.
+       
+                   Arguments:
+                       topo_file : string    // A json file which describes the exercise's
+                                                mininet topology.
+                       log_dir  : string     // Path to a directory for storing exercise logs
+                       pcap_dir : string     // Ditto, but for mininet switch pcap files
+                       switch_json : string  // Path to a compiled p4 json for bmv2
+                       bmv2_exe    : string  // Path to the p4 behavioral binary
+                       quiet : bool          // Enable/disable script debug messages
+               """
+       
+    1:         self.quiet = quiet
+    1:         self.logger('Reading topology file.')
+    1:         with open(topo_file, 'r') as f:
+    1:             topo = json.load(f)
+    1:         self.hosts = topo['hosts']
+    1:         self.switches = topo['switches']
+    1:         self.links = self.parse_links(topo['links'])
+       
+               # Ensure all the needed directories exist and are directories
+    3:         for dir_name in [log_dir, pcap_dir]:
+    2:             if not os.path.isdir(dir_name):
+                       if os.path.exists(dir_name):
+                           raise Exception("'%s' exists and is not a directory!" % dir_name)
+                       os.mkdir(dir_name)
+    1:         self.log_dir = log_dir
+    1:         self.pcap_dir = pcap_dir
+    1:         self.switch_json = switch_json
+    1:         self.bmv2_exe = bmv2_exe
+       
+       
+    1:     def run_exercise(self):
+               """ Sets up the mininet instance, programs the switches,
+                   and starts the mininet CLI. This is the main method to run after
+                   initializing the object.
+               """
+               # Initialize mininet with the topology specified by the config
+    1:         self.create_network()
+    1:         self.net.start()
+    1:         sleep(1)
+       
+               # some programming that must happen after the net has started
+    1:         self.program_hosts()
+    1:         self.program_switches()
+       
+               # wait for that to finish. Not sure how to do this better
+    1:         sleep(1)
+       
+    1:         self.do_net_cli()
+               # stop right after the CLI is exited
+    1:         self.net.stop()
+       
+       
+    1:     def parse_links(self, unparsed_links):
+               """ Given a list of links descriptions of the form [node1, node2, latency, bandwidth]
+                   with the latency and bandwidth being optional, parses these descriptions
+                   into dictionaries and store them as self.links
+               """
+    1:         links = []
+    9:         for link in unparsed_links:
+                   # make sure each link's endpoints are ordered alphabetically
+    8:             s, t, = link[0], link[1]
+    8:             if s > t:
+                       s,t = t,s
+       
+    8:             link_dict = {'node1':s,
+    8:                         'node2':t,
+    8:                         'latency':'0ms',
+    8:                         'bandwidth':None
+                               }
+    8:             if len(link) > 2:
+                       link_dict['latency'] = self.format_latency(link[2])
+    8:             if len(link) > 3:
+                       link_dict['bandwidth'] = link[3]
+       
+    8:             if link_dict['node1'][0] == 'h':
+    4:                 assert link_dict['node2'][0] == 's', 'Hosts should be connected to switches, not ' + str(link_dict['node2'])
+    8:             links.append(link_dict)
+    1:         return links
+       
+       
+    1:     def create_network(self):
+               """ Create the mininet network object, and store it as self.net.
+       
+                   Side effects:
+                       - Mininet topology instance stored as self.topo
+                       - Mininet instance stored as self.net
+               """
+    1:         self.logger("Building mininet topology.")
+       
+    1:         defaultSwitchClass = configureP4Switch(
+    1:                                 sw_path=self.bmv2_exe,
+    1:                                 json_path=self.switch_json,
+    1:                                 log_console=True,
+    1:                                 pcap_dump=self.pcap_dir)
+       
+    1:         self.topo = ExerciseTopo(self.hosts, self.switches, self.links, self.log_dir, self.bmv2_exe, self.pcap_dir)
+       
+    1:         self.net = Mininet(topo = self.topo,
+    1:                       link = TCLink,
+    1:                       host = P4Host,
+    1:                       switch = defaultSwitchClass,
+    1:                       controller = None)
+       
+    1:     def program_switch_p4runtime(self, sw_name, sw_dict):
+               """ This method will use P4Runtime to program the switch using the
+                   content of the runtime JSON file as input.
+               """
+    4:         sw_obj = self.net.get(sw_name)
+    4:         grpc_port = sw_obj.grpc_port
+    4:         device_id = sw_obj.device_id
+    4:         runtime_json = sw_dict['runtime_json']
+    4:         self.logger('Configuring switch %s using P4Runtime with file %s' % (sw_name, runtime_json))
+    4:         with open(runtime_json, 'r') as sw_conf_file:
+    4:             outfile = '%s/%s-p4runtime-requests.txt' %(self.log_dir, sw_name)
+    4:             p4runtime_lib.simple_controller.program_switch(
+    4:                 addr='127.0.0.1:%d' % grpc_port,
+    4:                 device_id=device_id,
+    4:                 sw_conf_file=sw_conf_file,
+    4:                 workdir=os.getcwd(),
+    4:                 proto_dump_fpath=outfile)
+       
+    1:     def program_switch_cli(self, sw_name, sw_dict):
+               """ This method will start up the CLI and use the contents of the
+                   command files as input.
+               """
+               cli = 'simple_switch_CLI'
+               # get the port for this particular switch's thrift server
+               sw_obj = self.net.get(sw_name)
+               thrift_port = sw_obj.thrift_port
+       
+               cli_input_commands = sw_dict['cli_input']
+               self.logger('Configuring switch %s with file %s' % (sw_name, cli_input_commands))
+               with open(cli_input_commands, 'r') as fin:
+                   cli_outfile = '%s/%s_cli_output.log'%(self.log_dir, sw_name)
+                   with open(cli_outfile, 'w') as fout:
+                       subprocess.Popen([cli, '--thrift-port', str(thrift_port)],
+                                        stdin=fin, stdout=fout)
+       
+    1:     def program_switches(self):
+               """ This method will program each switch using the BMv2 CLI and/or
+                   P4Runtime, depending if any command or runtime JSON files were
+                   provided for the switches.
+               """
+    5:         for sw_name, sw_dict in self.switches.iteritems():
+    4:             if 'cli_input' in sw_dict:
+                       self.program_switch_cli(sw_name, sw_dict)
+    4:             if 'runtime_json' in sw_dict:
+    4:                 self.program_switch_p4runtime(sw_name, sw_dict)
+       
+    1:     def program_hosts(self):
+               """ Execute any commands provided in the topology.json file on each Mininet host
+               """
+    5:         for host_name, host_info in self.hosts.items():
+    4:             h = self.net.get(host_name)
+    4:             if "commands" in host_info:
+   12:                 for cmd in host_info["commands"]:
+    8:                     h.cmd(cmd)
+       
+       
+    1:     def do_net_cli(self):
+               """ Starts up the mininet CLI and prints some helpful output.
+       
+                   Assumes:
+                       - A mininet instance is stored as self.net and self.net.start() has
+                         been called.
+               """
+    5:         for s in self.net.switches:
+    4:             s.describe()
+    5:         for h in self.net.hosts:
+    4:             h.describe()
+    1:         self.logger("Starting mininet CLI")
+               # Generate a message that will be printed by the Mininet CLI to make
+               # interacting with the simple switch a little easier.
+    1:         print('')
+    1:         print('======================================================================')
+    1:         print('Welcome to the BMV2 Mininet CLI!')
+    1:         print('======================================================================')
+    1:         print('Your P4 program is installed into the BMV2 software switch')
+    1:         print('and your initial runtime configuration is loaded. You can interact')
+    1:         print('with the network using the mininet CLI below.')
+    1:         print('')
+    1:         if self.switch_json:
+    1:             print('To inspect or change the switch configuration, connect to')
+    1:             print('its CLI from your host operating system using this command:')
+    1:             print('  simple_switch_CLI --thrift-port <switch thrift port>')
+    1:             print('')
+    1:         print('To view a switch log, run this command from your host OS:')
+    1:         print('  tail -f %s/<switchname>.log' %  self.log_dir)
+    1:         print('')
+    1:         print('To view the switch output pcap, check the pcap files in %s:' % self.pcap_dir)
+    1:         print(' for example run:  sudo tcpdump -xxx -r s1-eth1.pcap')
+    1:         print('')
+    1:         if 'grpc' in self.bmv2_exe:
+    1:             print('To view the P4Runtime requests sent to the switch, check the')
+    1:             print('corresponding txt file in %s:' % self.log_dir)
+    1:             print(' for example run:  cat %s/s1-p4runtime-requests.txt' % self.log_dir)
+    1:             print('')
+       
+    1:         CLI(self.net)
+       
+       
+    1: def get_args():
+    1:     cwd = os.getcwd()
+    1:     default_logs = os.path.join(cwd, 'logs')
+    1:     default_pcaps = os.path.join(cwd, 'pcaps')
+    1:     parser = argparse.ArgumentParser()
+    1:     parser.add_argument('-q', '--quiet', help='Suppress log messages.',
+    1:                         action='store_true', required=False, default=False)
+    1:     parser.add_argument('-t', '--topo', help='Path to topology json',
+    1:                         type=str, required=False, default='./topology.json')
+    1:     parser.add_argument('-l', '--log-dir', type=str, required=False, default=default_logs)
+    1:     parser.add_argument('-p', '--pcap-dir', type=str, required=False, default=default_pcaps)
+    1:     parser.add_argument('-j', '--switch_json', type=str, required=False)
+    1:     parser.add_argument('-b', '--behavioral-exe', help='Path to behavioral executable',
+    1:                                 type=str, required=False, default='simple_switch')
+    1:     return parser.parse_args()
+       
+       
+    1: if __name__ == '__main__':
+           # from mininet.log import setLogLevel
+    1:     setLogLevel("debug")
+       
+    1:     args = get_args()
+    1:     exercise = ExerciseRunner(args.topo, args.log_dir, args.pcap_dir,
+    1:                               args.switch_json, args.behavioral_exe, args.quiet)
+       
+    1:     exercise.run_exercise()
+       
