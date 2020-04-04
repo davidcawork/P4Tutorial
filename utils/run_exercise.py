@@ -263,7 +263,7 @@ class ExerciseRunner:
             content of the runtime JSON file as input.
         """
         sw_obj = self.net.get(sw_name)
-	sw_obj.cmd('python ../utils/program_p4runtime_switch.py %s %s %s %s %s' % (sw_obj.grpc_port,
+	sw_obj.cmd('python ../../utils/program_p4runtime_switch.py %s %s %s %s %s' % (sw_obj.grpc_port,
 										   sw_obj.device_id,
 										   sw_dict['runtime_json'],
 										   sw_name,
