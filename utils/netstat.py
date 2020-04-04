@@ -20,6 +20,6 @@ def check_listening_on_port_pid(port, _pid=None):
 
 def check_listening_on_port(port):
     for c in psutil.net_connections(kind='inet'):
-        if c.status == 'ESTABLISHED' and c.laddr[1] == port:
+        if c.status == 'LISTEN' and c.laddr[1] == port:
             return True
     return False
